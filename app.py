@@ -1,5 +1,6 @@
 import io
 import re
+import time
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -43,6 +44,7 @@ csv_asset_choice = st.sidebar.selectbox(
     ],
     index=0
 )
+data_status_box = st.sidebar.empty()
 
 ticker_map = {
     'Bitcoin (BTC)':           'bitcoin',
@@ -75,15 +77,42 @@ def get_election_regime(year):
 # ==============================================================================
 # DATA PIPELINE (COINGECKO LIVE + LARGE 1M CSV STREAMING RESAMPLER)
 # ==============================================================================
-def _normalize_gdrive_url(url):
-    u = url.strip()
-    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", u)
+def _extract_gdrive_id(url):
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
     if m:
-        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-    m2 = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", u)
-    if "drive.google.com" in u and m2:
-        return f"https://drive.google.com/uc?export=download&id={m2.group(1)}"
-    return u
+        return m.group(1)
+    m2 = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if m2:
+        return m2.group(1)
+    return None
+
+def _open_remote_csv_stream(raw_url):
+    u = raw_url.strip()
+    file_id = _extract_gdrive_id(u)
+    session = requests.Session()
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    if file_id:
+        url = f"https://drive.usercontent.google.com/download?export=download&id={file_id}&confirm=t"
+        resp = session.get(url, headers=headers, stream=True, timeout=60)
+        resp.raise_for_status()
+        ct = resp.headers.get("Content-Type", "")
+        if "text/html" in ct:
+            html_text = resp.text
+            action_match = re.search(r'action="([^"]+)"', html_text)
+            inputs = dict(re.findall(r'name="([^"]+)"\s+value="([^"]*)"', html_text))
+            if action_match and inputs:
+                action_url = action_match.group(1).replace("&amp;", "&")
+                resp = session.get(action_url, params=inputs, headers=headers, stream=True, timeout=60)
+                resp.raise_for_status()
+                ct = resp.headers.get("Content-Type", "")
+        if "text/html" in ct:
+            raise ValueError("Google Drive returned an HTML page instead of CSV file data. Check sharing permissions.")
+        return resp
+
+    resp = session.get(u, headers=headers, stream=True, timeout=60)
+    resp.raise_for_status()
+    return resp
 
 def _clean_chunk(df, time_col):
     ts = df[time_col]
@@ -104,45 +133,18 @@ def _clean_chunk(df, time_col):
         out[col] = pd.to_numeric(out[col], errors='coerce')
     return out[['open', 'high', 'low', 'close', 'volume']].dropna(subset=['close'])
 
-@st.cache_data(ttl=3600, show_spinner="Streaming & resampling large 1m CSV...")
+@st.cache_data(ttl=3600, show_spinner="Streaming & resampling 1m CSV...")
 def _load_and_resample_large_csv(raw_url, interval_str):
     rule_map = {'1m': '1min', '5m': '5min', '15m': '15min', '1h': '1h', '4h': '4h'}
     rule = rule_map.get(interval_str)
     if not rule:
         return None
 
-    dl_url = _normalize_gdrive_url(raw_url)
-    session = requests.Session()
-    resp = session.get(dl_url, stream=True, timeout=30)
-    resp.raise_for_status()
+    resp = _open_remote_csv_stream(raw_url)
+    resp.raw.decode_content = True
 
-    # Handle Google Drive large-file confirmation token if present
-    ct = resp.headers.get("Content-Type", "")
-    if "text/html" in ct:
-        html_text = resp.text
-        confirm_match = re.search(r"confirm=([0-9A-Za-z_]+)", html_text)
-        uuid_match = re.search(r'name="uuid"\s+value="([^"]+)"', html_text)
-        id_match = re.search(r"/file/d/([a-zA-Z0-9_-]+)|[?&]id=([a-zA-Z0-9_-]+)", raw_url)
-        file_id = (id_match.group(1) or id_match.group(2)) if id_match else None
-        if file_id:
-            params = {"export": "download", "id": file_id}
-            if confirm_match:
-                params["confirm"] = confirm_match.group(1)
-            if uuid_match:
-                params["uuid"] = uuid_match.group(1)
-            resp = session.get("https://drive.usercontent.google.com/download", params=params, stream=True, timeout=30)
-            resp.raise_for_status()
-
-    chunks = []
-    for chunk in resp.iter_content(chunk_size=1024 * 1024):
-        if chunk:
-            chunks.append(chunk)
-    raw_bytes = b"".join(chunks)
-    if not raw_bytes:
-        return None
-
-    # Read in chunks to keep peak memory lower
-    reader = pd.read_csv(io.BytesIO(raw_bytes), chunksize=100000)
+    # Stream directly from response body in chunks without building a 400 MB byte string first
+    reader = pd.read_csv(resp.raw, chunksize=50000)
     resampled_parts = []
     time_col = None
 
@@ -167,7 +169,6 @@ def _load_and_resample_large_csv(raw_url, interval_str):
         return None
 
     merged = pd.concat(resampled_parts).sort_index()
-    # Re-aggregate any boundary bars across chunk splits
     final_df = merged.groupby(level=0).agg({
         'open': 'first',
         'high': 'max',
@@ -177,7 +178,7 @@ def _load_and_resample_large_csv(raw_url, interval_str):
     }).sort_index()
     return final_df[['open', 'high', 'low', 'close', 'volume']]
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def _fetch_coingecko_history(cg_id, interval_str):
     days_map = {
         '1m': '1', '5m': '7', '15m': '30',
@@ -186,8 +187,17 @@ def _fetch_coingecko_history(cg_id, interval_str):
     }
     days = days_map.get(interval_str, '365')
     url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart?vs_currency=usd&days={days}"
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
+
+    for attempt in range(3):
+        resp = requests.get(url, timeout=12)
+        if resp.status_code == 429:
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        resp.raise_for_status()
+        break
+    else:
+        return None
+
     data = resp.json()
     prices = data.get('prices', [])
     if not prices:
@@ -231,10 +241,13 @@ def _fetch_coingecko_history(cg_id, interval_str):
 def fetch_legacy_market_data(asset_name, interval_str):
     cg_id = ticker_map.get(asset_name)
     df_live = None
+    source_note = []
 
     if cg_id is not None:
         try:
             df_live = _fetch_coingecko_history(cg_id, interval_str)
+            if df_live is not None and not df_live.empty:
+                source_note.append(f"Live ({len(df_live)} bars)")
         except Exception:
             df_live = None
 
@@ -243,15 +256,21 @@ def fetch_legacy_market_data(asset_name, interval_str):
         try:
             df_csv = _load_and_resample_large_csv(csv_url_input.strip(), interval_str)
             if df_csv is not None and not df_csv.empty:
+                source_note.append(f"CSV ({len(df_csv)} bars)")
                 if df_live is None or df_live.empty:
+                    data_status_box.caption("📡 Source: " + " | ".join(source_note))
                     return df_csv
                 hist_gap = df_csv[df_csv.index < df_live.index.min()]
                 if not hist_gap.empty:
                     combined = pd.concat([hist_gap, df_live])
-                    return combined[~combined.index.duplicated(keep='last')].sort_index()
-        except Exception:
-            pass
+                    merged = combined[~combined.index.duplicated(keep='last')].sort_index()
+                    data_status_box.caption(f"📡 Source: CSV + Live ({len(merged)} bars)")
+                    return merged
+        except Exception as e:
+            data_status_box.caption(f"⚠️ CSV skipped: {e}")
 
+    if source_note:
+        data_status_box.caption("📡 Source: " + " | ".join(source_note))
     return df_live
 
 # ==============================================================================
@@ -449,7 +468,9 @@ if app_mode == "Algorithmic Fractal Scan":
             assets_to_scan = list(ticker_map.keys()) if s_pool == "All Assets" else [s_pool]
             all_discovered_results = []
 
-            for asset_item in assets_to_scan:
+            for idx_a, asset_item in enumerate(assets_to_scan):
+                if idx_a > 0 and i_choice in {'1m', '5m', '15m', '1h', '4h'}:
+                    time.sleep(0.4)
                 df_scan = fetch_legacy_market_data(asset_item, i_choice)
                 if df_scan is None or df_scan.empty: continue
                 close_scan = df_scan['close'].dropna()
