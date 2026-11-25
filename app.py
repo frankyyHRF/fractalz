@@ -1,3 +1,5 @@
+import io
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -30,24 +32,33 @@ app_mode = st.sidebar.selectbox(
     ["Algorithmic Fractal Scan", "Structural Capitulation Wave", "Statistical Framework Core"]
 )
 
-ticker_map = {
-    'Bitcoin (BTC)':           'BTCUSDT',
-    'Ethereum (ETH)':          'ETHUSDT',
-    'S&P 500 (SPX)':           None,
-    'Binance Coin (BNB)':      'BNBUSDT',
-    'Solana (SOL)':            'SOLUSDT',
-    'Cardano (ADA)':           'ADAUSDT',
-    'Dogecoin (DOGE)':         'DOGEUSDT',
-    'TRON (TRX)':              'TRXUSDT',
-    'Bitcoin Cash (BCH)':      'BCHUSDT',
-    'Litecoin (LTC)':          'LTCUSDT',
-    'Bittensor (TAO)':         'TAOUSDT',
-    'Bitget Token (BGB)':      None,
-    'Internet Computer (ICP)': 'ICPUSDT'
-}
+csv_url_input = st.sidebar.text_input("🔗 Large 1m CSV Link (Google Drive / Direct URL)", value="")
+csv_asset_choice = st.sidebar.selectbox(
+    "CSV Asset Match",
+    [
+        'Bitcoin (BTC)', 'Ethereum (ETH)', 'S&P 500 (SPX)', 'Binance Coin (BNB)',
+        'Solana (SOL)', 'Cardano (ADA)', 'Dogecoin (DOGE)', 'TRON (TRX)',
+        'Bitcoin Cash (BCH)', 'Litecoin (LTC)', 'Bittensor (TAO)',
+        'Bitget Token (BGB)', 'Internet Computer (ICP)'
+    ],
+    index=0
+)
 
-CSV_1M_PATH = "your_1m_dataset.csv"
-CSV_ASSET_NAME = "Bitcoin (BTC)"
+ticker_map = {
+    'Bitcoin (BTC)':           'bitcoin',
+    'Ethereum (ETH)':          'ethereum',
+    'S&P 500 (SPX)':           None,
+    'Binance Coin (BNB)':      'binancecoin',
+    'Solana (SOL)':            'solana',
+    'Cardano (ADA)':           'cardano',
+    'Dogecoin (DOGE)':         'dogecoin',
+    'TRON (TRX)':              'tron',
+    'Bitcoin Cash (BCH)':      'bitcoin-cash',
+    'Litecoin (LTC)':          'litecoin',
+    'Bittensor (TAO)':         'bittensor',
+    'Bitget Token (BGB)':      'bitget-token',
+    'Internet Computer (ICP)': 'internet-computer'
+}
 
 def percentage_return_scale(series):
     arr = np.array(series, dtype=float).flatten()
@@ -62,85 +73,175 @@ def get_election_regime(year):
     else: return 'Pre-Election'
 
 # ==============================================================================
-# DATA PIPELINE + 1M CSV HISTORICAL FALLBACK
+# DATA PIPELINE (COINGECKO LIVE + LARGE 1M CSV STREAMING RESAMPLER)
 # ==============================================================================
-def _load_1m_csv_fallback(csv_path):
-    df = pd.read_csv(csv_path)
-    time_col = next(
-        (c for c in ['time', 'timestamp', 'date', 'open_time', 'datetime'] if c in df.columns),
-        df.columns[0]
-    )
+def _normalize_gdrive_url(url):
+    u = url.strip()
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", u)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    m2 = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", u)
+    if "drive.google.com" in u and m2:
+        return f"https://drive.google.com/uc?export=download&id={m2.group(1)}"
+    return u
+
+def _clean_chunk(df, time_col):
     ts = df[time_col]
     if pd.api.types.is_numeric_dtype(ts):
-        unit = 'us' if ts.max() > 1e14 else ('ms' if ts.max() > 1e11 else 's')
-        idx = pd.to_datetime(ts, unit=unit)
+        max_v = ts.max()
+        unit = 'us' if max_v > 1e14 else ('ms' if max_v > 1e11 else 's')
+        idx = pd.to_datetime(ts, unit=unit, errors='coerce')
     else:
-        idx = pd.to_datetime(ts)
+        idx = pd.to_datetime(ts, errors='coerce')
 
-    df = df.copy()
-    df.index = idx
-    df.index.name = 'time'
-    df.columns = [str(c).strip().lower() for c in df.columns]
+    out = df.copy()
+    out.index = idx
+    out.index.name = 'time'
+    out.columns = [str(c).strip().lower() for c in out.columns]
     for col in ['open', 'high', 'low', 'close', 'volume']:
-        if col not in df.columns:
-            df[col] = df['close'] if col != 'volume' else 0.0
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+        if col not in out.columns:
+            out[col] = out['close'] if (col != 'volume' and 'close' in out.columns) else 0.0
+        out[col] = pd.to_numeric(out[col], errors='coerce')
+    return out[['open', 'high', 'low', 'close', 'volume']].dropna(subset=['close'])
 
-    return df[['open', 'high', 'low', 'close', 'volume']].dropna(subset=['close']).sort_index()
-
-def _resample_1m_to_interval(df_1m, interval_str):
+@st.cache_data(ttl=3600, show_spinner="Streaming & resampling large 1m CSV...")
+def _load_and_resample_large_csv(raw_url, interval_str):
     rule_map = {'1m': '1min', '5m': '5min', '15m': '15min', '1h': '1h', '4h': '4h'}
-    if interval_str == '1m':
-        return df_1m
     rule = rule_map.get(interval_str)
     if not rule:
         return None
-    return df_1m.resample(rule).agg({
+
+    dl_url = _normalize_gdrive_url(raw_url)
+    session = requests.Session()
+    resp = session.get(dl_url, stream=True, timeout=30)
+    resp.raise_for_status()
+
+    # Handle Google Drive large-file confirmation token if present
+    ct = resp.headers.get("Content-Type", "")
+    if "text/html" in ct:
+        html_text = resp.text
+        confirm_match = re.search(r"confirm=([0-9A-Za-z_]+)", html_text)
+        uuid_match = re.search(r'name="uuid"\s+value="([^"]+)"', html_text)
+        id_match = re.search(r"/file/d/([a-zA-Z0-9_-]+)|[?&]id=([a-zA-Z0-9_-]+)", raw_url)
+        file_id = (id_match.group(1) or id_match.group(2)) if id_match else None
+        if file_id:
+            params = {"export": "download", "id": file_id}
+            if confirm_match:
+                params["confirm"] = confirm_match.group(1)
+            if uuid_match:
+                params["uuid"] = uuid_match.group(1)
+            resp = session.get("https://drive.usercontent.google.com/download", params=params, stream=True, timeout=30)
+            resp.raise_for_status()
+
+    chunks = []
+    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+        if chunk:
+            chunks.append(chunk)
+    raw_bytes = b"".join(chunks)
+    if not raw_bytes:
+        return None
+
+    # Read in chunks to keep peak memory lower
+    reader = pd.read_csv(io.BytesIO(raw_bytes), chunksize=100000)
+    resampled_parts = []
+    time_col = None
+
+    for part in reader:
+        if time_col is None:
+            time_col = next(
+                (c for c in ['time', 'timestamp', 'date', 'open_time', 'datetime'] if c in part.columns),
+                part.columns[0]
+            )
+        cleaned = _clean_chunk(part, time_col).sort_index()
+        if not cleaned.empty:
+            r_part = cleaned.resample(rule).agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna(subset=['close'])
+            resampled_parts.append(r_part)
+
+    if not resampled_parts:
+        return None
+
+    merged = pd.concat(resampled_parts).sort_index()
+    # Re-aggregate any boundary bars across chunk splits
+    final_df = merged.groupby(level=0).agg({
         'open': 'first',
         'high': 'max',
         'low': 'min',
         'close': 'last',
         'volume': 'sum'
-    }).dropna(subset=['close'])
+    }).sort_index()
+    return final_df[['open', 'high', 'low', 'close', 'volume']]
 
-def _fetch_binance_klines(symbol, interval_str, limit=1000):
-    tf_map = {
-        '1m': '1m', '5m': '5m', '15m': '15m',
-        '1h': '1h', '4h': '4h', '1day': '1d',
-        '1 week': '1w', '1month': '1M'
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_coingecko_history(cg_id, interval_str):
+    days_map = {
+        '1m': '1', '5m': '7', '15m': '30',
+        '1h': '90', '4h': '180', '1day': '365',
+        '1 week': 'max', '1month': 'max'
     }
-    b_tf = tf_map.get(interval_str, '1d')
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={b_tf}&limit={min(limit, 1000)}"
-    resp = requests.get(url, timeout=8)
+    days = days_map.get(interval_str, '365')
+    url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart?vs_currency=usd&days={days}"
+    resp = requests.get(url, timeout=10)
     resp.raise_for_status()
-    raw = resp.json()
-    if not raw:
+    data = resp.json()
+    prices = data.get('prices', [])
+    if not prices:
         return None
-    df = pd.DataFrame(raw).iloc[:, :6]
-    df.columns = ['open_time', 'open', 'high', 'low', 'close', 'volume']
-    ts = pd.to_numeric(df['open_time'], errors='coerce')
-    ts_ms = np.where(ts > 1e14, ts // 1000, ts)
-    df['time'] = pd.to_datetime(ts_ms, unit='ms')
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df.dropna(subset=['time', 'close']).set_index('time').sort_index()[['open', 'high', 'low', 'close', 'volume']]
 
-@st.cache_data(show_spinner=False)
+    df = pd.DataFrame(prices, columns=['ts', 'close'])
+    df['time'] = pd.to_datetime(df['ts'], unit='ms')
+    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+    df = df.dropna(subset=['time', 'close']).set_index('time').sort_index()
+
+    vols = data.get('total_volumes', [])
+    if vols:
+        v_df = pd.DataFrame(vols, columns=['ts', 'volume'])
+        v_df['time'] = pd.to_datetime(v_df['ts'], unit='ms')
+        v_df = v_df.set_index('time').sort_index()
+        df['volume'] = pd.to_numeric(v_df['volume'], errors='coerce').reindex(df.index, method='nearest').fillna(0.0)
+    else:
+        df['volume'] = 0.0
+
+    df['open'] = df['close'].shift(1).fillna(df['close'])
+    df['high'] = df[['open', 'close']].max(axis=1)
+    df['low'] = df[['open', 'close']].min(axis=1)
+
+    resample_rules = {
+        '1m': '1min', '5m': '5min', '15m': '15min',
+        '1h': '1h', '4h': '4h', '1day': '1D',
+        '1 week': '1W', '1month': '1ME'
+    }
+    rule = resample_rules.get(interval_str)
+    if rule:
+        df = df.resample(rule).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna(subset=['close'])
+
+    return df[['open', 'high', 'low', 'close', 'volume']]
+
 def fetch_legacy_market_data(asset_name, interval_str):
-    symbol = ticker_map.get(asset_name)
+    cg_id = ticker_map.get(asset_name)
     df_live = None
 
-    if symbol is not None:
+    if cg_id is not None:
         try:
-            df_live = _fetch_binance_klines(symbol, interval_str, limit=1000)
+            df_live = _fetch_coingecko_history(cg_id, interval_str)
         except Exception:
             df_live = None
 
     intraday_frames = {'1m', '5m', '15m', '1h', '4h'}
-    if asset_name == CSV_ASSET_NAME and interval_str in intraday_frames:
+    if csv_url_input.strip() and asset_name == csv_asset_choice and interval_str in intraday_frames:
         try:
-            df_1m = _load_1m_csv_fallback(CSV_1M_PATH)
-            df_csv = _resample_1m_to_interval(df_1m, interval_str)
+            df_csv = _load_and_resample_large_csv(csv_url_input.strip(), interval_str)
             if df_csv is not None and not df_csv.empty:
                 if df_live is None or df_live.empty:
                     return df_csv
