@@ -1,6 +1,6 @@
+import gc
 import io
 import re
-import time
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -33,40 +33,31 @@ app_mode = st.sidebar.selectbox(
     ["Algorithmic Fractal Scan", "Structural Capitulation Wave", "Statistical Framework Core"]
 )
 
-csv_url_input = st.sidebar.text_input("🔗 Large 1m CSV Link (Google Drive / Direct URL)", value="")
-csv_asset_choice = st.sidebar.selectbox(
-    "CSV Asset Match",
-    [
-        'Bitcoin (BTC)', 'Ethereum (ETH)', 'S&P 500 (SPX)', 'Binance Coin (BNB)',
-        'Solana (SOL)', 'Cardano (ADA)', 'Dogecoin (DOGE)', 'TRON (TRX)',
-        'Bitcoin Cash (BCH)', 'Litecoin (LTC)', 'Bittensor (TAO)',
-        'Bitget Token (BGB)', 'Internet Computer (ICP)'
-    ],
-    index=0
+csv_url_input = st.sidebar.text_input("🔗 Optional Data Link (.parquet / .csv / Google Drive)", value="")
+max_short_bars = st.sidebar.number_input(
+    "Max Short-TF Bars (RAM Guard)",
+    min_value=500,
+    max_value=25000,
+    value=4000,
+    step=500
 )
+
+if st.sidebar.button("🧹 Clear Cache & Free RAM"):
+    st.cache_data.clear()
+    gc.collect()
+    st.rerun()
+
 data_status_box = st.sidebar.empty()
 
 ticker_map = {
-    'Bitcoin (BTC)':           'bitcoin',
-    'Ethereum (ETH)':          'ethereum',
-    'S&P 500 (SPX)':           None,
-    'Binance Coin (BNB)':      'binancecoin',
-    'Solana (SOL)':            'solana',
-    'Cardano (ADA)':           'cardano',
-    'Dogecoin (DOGE)':         'dogecoin',
-    'TRON (TRX)':              'tron',
-    'Bitcoin Cash (BCH)':      'bitcoin-cash',
-    'Litecoin (LTC)':          'litecoin',
-    'Bittensor (TAO)':         'bittensor',
-    'Bitget Token (BGB)':      'bitget-token',
-    'Internet Computer (ICP)': 'internet-computer'
+    'Bitcoin (BTC)': 'XBTUSD',
 }
 
 def percentage_return_scale(series):
-    arr = np.array(series, dtype=float).flatten()
-    if len(arr) == 0 or arr[0] == 0:
-        return np.zeros_like(arr)
-    return ((arr - arr[0]) / arr[0]) * 100.0
+    arr = np.asarray(series, dtype=np.float32).flatten()
+    if arr.size == 0 or arr[0] == 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    return ((arr - arr[0]) / arr[0]) * np.float32(100.0)
 
 def get_election_regime(year):
     if year % 4 == 0: return 'Election Year'
@@ -75,12 +66,48 @@ def get_election_regime(year):
     else: return 'Pre-Election'
 
 # ==============================================================================
-# DATA PIPELINE (COINGECKO LIVE + LARGE 1M CSV STREAMING RESAMPLER)
+# DATA PIPELINE (KRAKEN PUBLIC OHLC + PARQUET / CSV LOW-RAM RESAMPLER)
 # ==============================================================================
+def _extract_gdrive_id(url):
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if m2:
+        return m2.group(1)
+    return None
+
+def _open_remote_file_response(raw_url):
+    u = raw_url.strip()
+    file_id = _extract_gdrive_id(u)
+    session = requests.Session()
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    if file_id:
+        url = f"https://drive.usercontent.google.com/download?export=download&id={file_id}&confirm=t"
+        resp = session.get(url, headers=headers, stream=True, timeout=60)
+        resp.raise_for_status()
+        ct = resp.headers.get("Content-Type", "")
+        if "text/html" in ct:
+            html_text = resp.text
+            action_match = re.search(r'action="([^"]+)"', html_text)
+            inputs = dict(re.findall(r'name="([^"]+)"\s+value="([^"]*)"', html_text))
+            if action_match and inputs:
+                action_url = action_match.group(1).replace("&amp;", "&")
+                resp = session.get(action_url, params=inputs, headers=headers, stream=True, timeout=60)
+                resp.raise_for_status()
+                ct = resp.headers.get("Content-Type", "")
+        if "text/html" in ct:
+            raise ValueError("Google Drive returned HTML instead of data file. Check link sharing.")
+        return resp
+
+    resp = session.get(u, headers=headers, stream=True, timeout=60)
+    resp.raise_for_status()
+    return resp
+
 def _normalize_ohlcv_df(df):
     out = df.copy()
 
-    # If timestamps are already a DatetimeIndex, keep them; otherwise locate a time column
     if not isinstance(out.index, pd.DatetimeIndex):
         out.columns = [str(c).strip().lower() for c in out.columns]
         time_col = next(
@@ -113,23 +140,20 @@ def _normalize_ohlcv_df(df):
     out = out[~out.index.isna()].sort_index()
     return out[~out.index.duplicated(keep="last")]
 
-
 @st.cache_data(ttl=1800, max_entries=2, show_spinner="Loading & resampling remote data...")
 def _load_and_resample_remote_file(raw_url, interval_str, bar_cap):
-    rule_map = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h"}
+    rule_map = {'1m': '1min', '5m': '5min', '15m': '15min', '1h': '1h', '4h': '4h'}
     rule = rule_map.get(interval_str)
     if not rule:
         return None
 
     cap = int(bar_cap)
     keep_tail = max(cap * 2, 5000)
-    resp = _open_remote_csv_stream(raw_url)
-
+    resp = _open_remote_file_response(raw_url)
     content_bytes = resp.content
     if not content_bytes:
-        raise ValueError("Downloaded file is empty.")
+        raise ValueError("Remote file returned empty content.")
 
-    # Detect Parquet either by URL extension or Parquet magic bytes ("PAR1")
     is_parquet = (
         ".parquet" in raw_url.lower()
         or content_bytes[:4] == b"PAR1"
@@ -155,43 +179,39 @@ def _load_and_resample_remote_file(raw_url, interval_str, bar_cap):
         resampled = (
             cleaned.resample(rule)
             .agg({
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
             })
-            .dropna(subset=["close"])
+            .dropna(subset=['close'])
             .iloc[-cap:]
         )
         del cleaned
         gc.collect()
-        return resampled[["open", "high", "low", "close", "volume"]]
+        return resampled[['open', 'high', 'low', 'close', 'volume']]
 
-    # Fallback: chunked CSV streaming
     buf = io.BytesIO(content_bytes)
     del content_bytes
     gc.collect()
 
     reader = pd.read_csv(buf, chunksize=25000)
     rolling_df = None
+
     for part in reader:
         cleaned = _normalize_ohlcv_df(part)
         if not cleaned.empty:
-            r_part = (
-                cleaned.resample(rule)
-                .agg({
-                    "open": "first",
-                    "high": "max",
-                    "low": "min",
-                    "close": "last",
-                    "volume": "sum",
-                })
-                .dropna(subset=["close"])
-            )
+            r_part = cleaned.resample(rule).agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna(subset=['close'])
             rolling_df = r_part if rolling_df is None else pd.concat([rolling_df, r_part])
             rolling_df = rolling_df.sort_index()
-            rolling_df = rolling_df[~rolling_df.index.duplicated(keep="last")].iloc[-keep_tail:]
+            rolling_df = rolling_df[~rolling_df.index.duplicated(keep='last')].iloc[-keep_tail:]
             del cleaned, r_part
 
     del reader, buf
@@ -203,7 +223,83 @@ def _load_and_resample_remote_file(raw_url, interval_str, bar_cap):
     final_df = rolling_df.iloc[-cap:].copy()
     del rolling_df
     gc.collect()
-    return final_df[["open", "high", "low", "close", "volume"]]
+    return final_df[['open', 'high', 'low', 'close', 'volume']]
+
+@st.cache_data(ttl=120, max_entries=4, show_spinner=False)
+def _fetch_kraken_btc_ohlc(interval_str, bar_cap):
+    tf_map = {
+        '1m': 1, '5m': 5, '15m': 15, '1h': 60,
+        '4h': 240, '1day': 1440, '1 week': 10080, '1month': 21600,
+    }
+    k_interval = tf_map.get(interval_str, 1440)
+    url = f"https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval={k_interval}"
+    resp = requests.get(url, timeout=12)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    if payload.get("error"):
+        raise ValueError(", ".join(payload["error"]))
+
+    result = payload.get("result", {})
+    candle_key = next((k for k in result if k != "last"), None)
+    if not candle_key or not result[candle_key]:
+        return None
+
+    rows = result[candle_key]
+    df = pd.DataFrame(rows, columns=['ts', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+    df['time'] = pd.to_datetime(pd.to_numeric(df['ts'], errors='coerce'), unit='s')
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
+
+    df = df.dropna(subset=['time', 'close']).set_index('time').sort_index()
+    df = df[~df.index.duplicated(keep='last')]
+
+    if interval_str == '1month':
+        df = df.resample('1ME').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+        }).dropna(subset=['close'])
+
+    if interval_str in {'1m', '5m', '15m', '1h', '4h'}:
+        df = df.iloc[-int(bar_cap):]
+
+    return df[['open', 'high', 'low', 'close', 'volume']]
+
+def fetch_legacy_market_data(asset_name, interval_str):
+    df_live = None
+    source_note = []
+    cap = int(max_short_bars)
+
+    try:
+        df_live = _fetch_kraken_btc_ohlc(interval_str, cap)
+        if df_live is not None and not df_live.empty:
+            source_note.append(f"Kraken BTC ({len(df_live)} bars)")
+    except Exception as e:
+        source_note.append(f"Kraken err: {e}")
+        df_live = None
+
+    intraday_frames = {'1m', '5m', '15m', '1h', '4h'}
+    if csv_url_input.strip() and interval_str in intraday_frames:
+        try:
+            df_file = _load_and_resample_remote_file(csv_url_input.strip(), interval_str, cap)
+            if df_file is not None and not df_file.empty:
+                source_note.append(f"File ({len(df_file)} bars)")
+                if df_live is None or df_live.empty:
+                    data_status_box.caption("📡 Source: " + " | ".join(source_note))
+                    return df_file
+                hist_gap = df_file[df_file.index < df_live.index.min()]
+                if not hist_gap.empty:
+                    combined = pd.concat([hist_gap, df_live])
+                    merged = combined[~combined.index.duplicated(keep='last')].sort_index().iloc[-cap:]
+                    del hist_gap, combined
+                    gc.collect()
+                    data_status_box.caption(f"📡 Source: File + Kraken ({len(merged)} bars)")
+                    return merged
+        except Exception as e:
+            source_note.append(f"File skipped: {e}")
+
+    if source_note:
+        data_status_box.caption("📡 Source: " + " | ".join(source_note))
+    return df_live
 
 # ==============================================================================
 # NATIVE VECTORIZED MATH AND INDICATORS CALCULATOR
@@ -216,9 +312,9 @@ def calculate_custom_indicators(df, cfg):
 
     df['SMA'] = close.rolling(window=cfg['sma_p']).mean()
     df['EMA'] = close.ewm(span=cfg['ema_p'], adjust=False).mean()
-    df['WMA'] = close.rolling(window=cfg['wma_p']).apply(
-        lambda x: np.dot(x, np.arange(1, cfg['wma_p'] + 1)) / np.arange(1, cfg['wma_p'] + 1).sum(), raw=True
-    )
+    w = np.arange(1, cfg['wma_p'] + 1, dtype=np.float32)
+    w_sum = w.sum()
+    df['WMA'] = close.rolling(window=cfg['wma_p']).apply(lambda x: np.dot(x, w) / w_sum, raw=True)
 
     delta = close.diff()
     gain = (delta.where(delta > 0, 0.0)).rolling(window=cfg['rsi_p']).mean()
@@ -250,7 +346,7 @@ def calculate_custom_indicators(df, cfg):
     upper_band = hl2 + (cfg['st_m'] * atr)
     lower_band = hl2 - (cfg['st_m'] * atr)
 
-    st_arr = np.zeros(len(df))
+    st_arr = np.zeros(len(df), dtype=np.float32)
     in_uptrend = True
     for i in range(1, len(df)):
         if close.iloc[i] > upper_band.iloc[i-1]:
@@ -259,24 +355,25 @@ def calculate_custom_indicators(df, cfg):
             in_uptrend = False
         st_arr[i] = lower_band.iloc[i] if in_uptrend else upper_band.iloc[i]
     df['SuperTrend'] = st_arr
-
     return df
 
 def calculate_rolling_correlation(series_a, series_b, lookback_window):
-    arr_a = np.array(series_a, dtype=float).flatten()
-    arr_b = np.array(series_b, dtype=float).flatten()
+    arr_a = np.asarray(series_a, dtype=np.float32).flatten()
+    arr_b = np.asarray(series_b, dtype=np.float32).flatten()
     min_len = min(len(arr_a), len(arr_b))
-    if min_len == 0: return []
+    if min_len == 0:
+        return []
     df = pd.DataFrame({'Target_Curve': arr_a[:min_len], 'Match_Curve': arr_b[:min_len]})
     df['Ret_A'] = df['Target_Curve'].pct_change()
     df['Ret_C'] = df['Match_Curve'].pct_change()
     return df['Ret_A'].rolling(window=int(lookback_window)).corr(df['Ret_C']).fillna(0.0).tolist()
 
 def calculate_hrf_path_drawdown(price_series):
-    prices = np.array(price_series)
+    prices = np.asarray(price_series, dtype=np.float32)
     n = len(prices)
-    drawdowns = np.zeros(n)
-    if n == 0: return drawdowns
+    drawdowns = np.zeros(n, dtype=np.float32)
+    if n == 0:
+        return drawdowns
     current_local_high = prices[0]
     for i in range(1, n):
         if prices[i] >= current_local_high:
@@ -297,32 +394,25 @@ if app_mode == "Algorithmic Fractal Scan":
     i_choice = st.sidebar.selectbox("Sequence Time Frame Interval", ['1month', '1 week', '1day', '4h', '1h', '15m', '5m', '1m'], index=2)
     f_mode = st.sidebar.selectbox("Framework Processing Mode", ["Calculate Fractals", "Manual Compare"], index=0)
 
-    st.sidebar.markdown("### 🎛️ Noise & Pattern Regime Filters")
+    st.sidebar.markdown("### 🎛️ Noise & Forward Regime Filters")
     corr_min, corr_max = st.sidebar.slider(
         "Correlation Filter Range (Min to Max)",
         min_value=-1.0,
         max_value=1.0,
-        value=(0.40, 1.00),
+        value=(0.30, 1.00),
         step=0.05
     )
     mse_min, mse_max = st.sidebar.slider(
         "MSE Error Filter Range (Min to Max)",
         min_value=0.0,
         max_value=200.0,
-        value=(0.0, 25.0),
+        value=(0.0, 30.0),
         step=0.5
     )
-    pattern_regime = st.sidebar.selectbox(
-        "Candidate Pattern Regime",
-        ["All", "Bullish", "Bearish", "Sideways"],
+    forward_regime = st.sidebar.selectbox(
+        "Forward-Looking Regime (After Matching Window)",
+        ["All", "Bullish", "Bearish"],
         index=0
-    )
-    sideways_thresh = st.sidebar.number_input(
-        "Sideways Band (+/- % Net Move)",
-        min_value=0.1,
-        max_value=25.0,
-        value=2.0,
-        step=0.1
     )
 
     st.sidebar.markdown("### 📊 Inter-Asset Correlation Layer")
@@ -345,12 +435,6 @@ if app_mode == "Algorithmic Fractal Scan":
     g_bars = st.sidebar.text_input("Temporal Separation Buffer Width (Bars)", value="20")
     v_boost = st.sidebar.text_input("Amplitude Volatility Boost Multiplier (%)", value="0")
     s_bands = st.sidebar.text_input("Standard Deviation Pipeline Bands (+/-)", value="1.0")
-
-    def classify_pattern_regime(scaled_window, sw_band):
-        net_shift = float(scaled_window[-1] - scaled_window[0])
-        if abs(net_shift) <= sw_band:
-            return "Sideways"
-        return "Bullish" if net_shift > sw_band else "Bearish"
 
     try:
         target_bars_num = int(t_bars)
@@ -392,11 +476,10 @@ if app_mode == "Algorithmic Fractal Scan":
         target_scaled = percentage_return_scale(target_df.to_numpy(dtype=np.float32))
         target_norm = target_scaled - np.mean(target_scaled)
         target_std = float(np.std(target_norm))
-        target_regime = classify_pattern_regime(target_scaled, float(sideways_thresh))
 
         st.caption(
-            f"Target Regime: **{target_regime}** | Corr Window: **[{corr_min:.2f}, {corr_max:.2f}]** | "
-            f"MSE Window: **[{mse_min:.1f}, {mse_max:.1f}]** | Regime Filter: **{pattern_regime}**"
+            f"Forward Regime: **{forward_regime}** | Corr: **[{corr_min:.2f}, {corr_max:.2f}]** | "
+            f"MSE: **[{mse_min:.1f}, {mse_max:.1f}]** | Forward Bars: **{forecast_bars_num}**"
         )
 
         plt.style.use('dark_background')
@@ -406,7 +489,7 @@ if app_mode == "Algorithmic Fractal Scan":
             fig_frac, ax1 = plt.subplots(1, 1, figsize=(14, 6.5))
             ax2 = None
 
-        ax1.plot(target_scaled, color='#00ffcc', linewidth=3.5, label=f'TARGET: {t_asset} ({i_choice}) [{target_regime}]', zorder=5)
+        ax1.plot(target_scaled, color='#00ffcc', linewidth=3.5, label=f'TARGET: {t_asset} ({i_choice})', zorder=5)
 
         if f_mode == "Manual Compare":
             starts = [s.strip() for s in ov_starts.split(',') if s.strip()]
@@ -420,13 +503,10 @@ if app_mode == "Algorithmic Fractal Scan":
                     if len(ov_df) == 0:
                         continue
                     ov_scaled = percentage_return_scale(ov_df.to_numpy(dtype=np.float32))
-                    reg_tag = classify_pattern_regime(ov_scaled, float(sideways_thresh))
-                    if pattern_regime != "All" and reg_tag != pattern_regime:
-                        continue
                     manual_paths_list.append(ov_scaled)
 
                     if isolate_clean == 'all' or (isolate_clean.isdigit() and int(isolate_clean) == idx + 1):
-                        ax1.plot(ov_scaled, linewidth=2, linestyle='--', alpha=0.65, label=f'Manual #{idx+1} [{reg_tag}]')
+                        ax1.plot(ov_scaled, linewidth=2, linestyle='--', alpha=0.65, label=f'Manual #{idx+1} [{st_val}]')
                 except Exception:
                     pass
 
@@ -466,14 +546,24 @@ if app_mode == "Algorithmic Fractal Scan":
                     if parsed_years and hist_year not in parsed_years:
                         continue
 
-                    hist_pattern = history_pool[i : i + target_bars_num]
-                    base_p = hist_pattern[0]
+                    window_slice = history_pool[i : i + win_len]
+                    base_p = window_slice[0]
                     if base_p == 0:
                         continue
-                    hist_scaled = ((hist_pattern - base_p) / base_p) * 100.0
 
-                    p_reg = classify_pattern_regime(hist_scaled, float(sideways_thresh))
-                    if pattern_regime != "All" and p_reg != pattern_regime:
+                    scaled_full = ((window_slice - base_p) / base_p) * 100.0
+                    hist_scaled = scaled_full[:target_bars_num]
+
+                    # Forward-looking price behavior AFTER the matching window ends
+                    anchor_val = scaled_full[target_bars_num - 1]
+                    fwd_slice = scaled_full[target_bars_num:]
+                    if fwd_slice.size == 0:
+                        continue
+                    fwd_net_change = float(fwd_slice[-1] - anchor_val)
+
+                    if forward_regime == "Bullish" and not (fwd_net_change > 0.0):
+                        continue
+                    if forward_regime == "Bearish" and not (fwd_net_change < 0.0):
                         continue
 
                     mse = float(np.mean((target_scaled - hist_scaled) ** 2))
@@ -486,19 +576,23 @@ if app_mode == "Algorithmic Fractal Scan":
                     if not (corr_min <= corr <= corr_max):
                         continue
 
-                    candidates.append((mse, corr, i, i + target_bars_num, history_dates[i].strftime('%Y-%m-%d %H:%M'), p_reg))
+                    f_tag = "Bullish" if fwd_net_change > 0 else ("Bearish" if fwd_net_change < 0 else "Flat")
+                    candidates.append((
+                        mse, corr, i, i + target_bars_num,
+                        history_dates[i].strftime('%Y-%m-%d %H:%M'), f_tag, fwd_net_change
+                    ))
 
             if candidates:
                 candidates.sort(key=lambda x: x[0])
                 unique_matches = []
-                for mse_val, corr_val, s_idx, e_idx, d_str, p_reg in candidates:
-                    if not any(max(s_idx, es - gap_bars_num) < min(e_idx, ee + gap_bars_num) for _, _, es, ee, _, _ in unique_matches):
-                        unique_matches.append((mse_val, corr_val, s_idx, e_idx, d_str, p_reg))
+                for mse_val, corr_val, s_idx, e_idx, d_str, f_tag, fwd_chg in candidates:
+                    if not any(max(s_idx, es - gap_bars_num) < min(e_idx, ee + gap_bars_num) for _, _, es, ee, _, _, _ in unique_matches):
+                        unique_matches.append((mse_val, corr_val, s_idx, e_idx, d_str, f_tag, fwd_chg))
                     if len(unique_matches) >= num_fractals_num:
                         break
 
                 all_scaled_paths = []
-                for _, _, s_idx, _, _, _ in unique_matches:
+                for _, _, s_idx, _, _, _, _ in unique_matches:
                     raw_full = history_pool[s_idx : s_idx + win_len]
                     scaled_full = ((raw_full - raw_full[0]) / raw_full[0]) * 100.0 if raw_full[0] != 0 else np.zeros_like(raw_full)
                     all_scaled_paths.append(scaled_full * (1.0 + (vol_boost_pct / 100.0)))
@@ -508,22 +602,22 @@ if app_mode == "Algorithmic Fractal Scan":
                 isolate_clean = iso_path.strip().lower()
 
                 if isolate_clean != 'mean':
-                    for idx, (mse_val, corr_val, _, _, d_str, p_reg) in enumerate(unique_matches):
+                    for idx, (mse_val, corr_val, _, _, d_str, f_tag, fwd_chg) in enumerate(unique_matches):
                         if isolate_clean.isdigit() and int(isolate_clean) != idx + 1:
                             continue
                         ax1.plot(
                             all_scaled_paths[idx],
                             linestyle='--',
-                            alpha=0.6,
-                            label=f"#{idx+1} [{p_reg}] r={corr_val:.2f} mse={mse_val:.1f} ({d_str})"
+                            alpha=0.65,
+                            label=f"#{idx+1} [{f_tag} {fwd_chg:+.1f}%] r={corr_val:.2f} mse={mse_val:.1f} ({d_str})"
                         )
 
                 if isolate_clean in ['all', 'mean']:
                     if std_dev_multiplier > 0:
                         std_path = np.std(stacked_paths, axis=0)
                         ax1.fill_between(range(len(mean_path_array)), mean_path_array - (std_path * std_dev_multiplier), mean_path_array + (std_path * std_dev_multiplier), color='#ff00ff', alpha=0.1)
-                    ax1.plot(mean_path_array, color='#ff00ff', linewidth=3.5, label=f'COMPOSITE MEAN ({pattern_regime})', zorder=6)
-                ax1.axvline(x=target_bars_num - 1, color='#ffffff', linestyle=':', alpha=0.5)
+                    ax1.plot(mean_path_array, color='#ff00ff', linewidth=3.5, label=f'COMPOSITE MEAN ({forward_regime})', zorder=6)
+                ax1.axvline(x=target_bars_num - 1, color='#ffffff', linestyle=':', alpha=0.6, label='Matching Window End')
 
                 if enable_corr and ax2 is not None:
                     r_wave = calculate_rolling_correlation(target_scaled, mean_path_array, c_win)
@@ -531,7 +625,7 @@ if app_mode == "Algorithmic Fractal Scan":
                     ax2.fill_between(range(len(r_wave)), r_wave, 0, where=(np.array(r_wave) >= 0), color='#00ff88', alpha=0.15)
                     ax2.fill_between(range(len(r_wave)), r_wave, 0, where=(np.array(r_wave) < 0), color='#ff0055', alpha=0.15)
             else:
-                st.warning("No fractals matched your current Correlation, MSE, and Regime filters. Widen the sliders or select 'All'.")
+                st.warning("No fractals matched your current Forward Regime, Correlation, and MSE filters. Adjust sliders or switch Forward Regime to 'All'.")
 
         ax1.axhline(y=0.0, color='#555555', linestyle='-', linewidth=1.2)
         ax1.set_title("HRF MATRIX ENGINE — Model By HRF", color='#ffffff', fontsize=12, fontweight='bold')
@@ -614,7 +708,7 @@ elif app_mode == "Structural Capitulation Wave":
                 hour = parts[1] if len(parts) > 1 else "00"
                 minute = parts[2] if len(parts) > 2 else "00"
                 return pd.to_datetime(f"{date_part} {hour}:{minute}:00")
-            except:
+            except Exception:
                 return pd.to_datetime(dt_str)
 
         start_dt = parse_custom_date(start_time_str)
@@ -622,8 +716,8 @@ elif app_mode == "Structural Capitulation Wave":
 
         df_filtered = df_calculated.loc[start_dt:end_dt].copy()
         if df_filtered.empty:
-            st.error("⚠️ Filter Error: No timeline entries found matching those specific coordinate blocks.")
-            st.stop()
+            st.warning("Date filter had no overlap with loaded bars—showing latest available bars instead.")
+            df_filtered = df_calculated.iloc[-min(500, len(df_calculated)):].copy()
 
         asset_val = df_filtered['close']
         ind_val = df_filtered[selected_ind_col]
@@ -653,35 +747,36 @@ elif app_mode == "Structural Capitulation Wave":
         plt.style.use('dark_background')
 
         if target_operation == "None (Just Plot Asset & Indicator)":
-            fig, ax1 = plt.subplots(1, 1, figsize=(16, 7))
+            fig, ax1 = plt.subplots(1, 1, figsize=(14, 6))
             ax1.plot(df_filtered.index, asset_val, color='#9400d3', linewidth=2.5, label=f"Asset Close ({stat_asset})")
             ax1.plot(df_filtered.index, ind_val, color='#ff007f', linewidth=2.0, linestyle="--", label=f"Indicator ({target_indicator})")
-            ax1.set_title(f"STRUCTURAL VISUAL METRIC MATRIX — Model By HRF", color='#ff007f', fontweight='bold', fontsize=12)
+            ax1.set_title("STRUCTURAL VISUAL METRIC MATRIX — Model By HRF", color='#ff007f', fontweight='bold', fontsize=12)
             ax1.grid(True, color='#222222', alpha=0.5)
             ax1.legend(loc='upper left', facecolor='#111111')
         else:
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 9), sharex=True, gridspec_kw={'height_ratios': [2, 1.5]})
-
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True, gridspec_kw={'height_ratios': [2, 1.5]})
             ax1.plot(df_filtered.index, asset_val, color='#9400d3', linewidth=2.5, label=f"Asset Close ({stat_asset})")
             ax1.plot(df_filtered.index, ind_val, color='#ffffff', linewidth=1.5, linestyle=":", label=f"Indicator ({target_indicator})")
-            ax1.set_title(f"STRUCTURAL CAPITULATION WAVE COMPONENTS", color='#ff007f', fontweight='bold', fontsize=11)
+            ax1.set_title("STRUCTURAL CAPITULATION WAVE COMPONENTS", color='#ff007f', fontweight='bold', fontsize=11)
             ax1.grid(True, color='#222222', alpha=0.4)
             ax1.legend(loc='upper left', facecolor='#111111')
 
             ax2.plot(df_filtered.index, output_curve, color='#ff0055', linewidth=3.0, label=op_title)
             ax2.fill_between(df_filtered.index, output_curve, output_curve.mean(), color='#9400d3', alpha=0.12)
-            ax2.set_title(f"ALGEBRAIC OUTPUT COEFFICIENT WAVE", color='#ffffff', fontweight='bold', fontsize=10)
+            ax2.set_title("ALGEBRAIC OUTPUT COEFFICIENT WAVE", color='#ffffff', fontweight='bold', fontsize=10)
             ax2.grid(True, color='#222222', alpha=0.4)
             ax2.legend(loc='upper left', facecolor='#111111')
 
         plt.tight_layout(pad=2.0)
         st.pyplot(fig)
+        plt.close(fig)
 
         st.subheader(f"📊 Matrix Metrics Sheet ({stat_asset} Engine Processing)")
         c1, c2, c3 = st.columns(3)
         c1.metric("Asset Execution Price", f"${asset_val.iloc[-1]:,.2f}")
         c2.metric(f"Active {selected_ind_col} Terminal", f"{ind_val.iloc[-1]:,.4f}")
         c3.metric("Final Transformed Yield Value", f"{output_curve.iloc[-1]:,.4f}")
+        gc.collect()
 
     except Exception as ex:
         st.error(f"Execution Error inside Statistical Pipeline Horizon: {ex}")
@@ -709,13 +804,12 @@ elif app_mode == "Statistical Framework Core":
 
         df_filtered = df_raw.loc[start_dt:end_dt].copy()
         if df_filtered.empty:
-            st.error("⚠️ Filter Error: No timeline records match your frame filters.")
-            st.stop()
+            st.warning("Date filter had no overlap with loaded bars—showing latest available bars instead.")
+            df_filtered = df_raw.iloc[-min(500, len(df_raw)):].copy()
 
         df_filtered['HRF_Drawdown'] = calculate_hrf_path_drawdown(df_filtered['close'])
 
         fig = go.Figure()
-
         fig.add_trace(go.Scatter(
             x=df_filtered.index,
             y=df_filtered['close'],
@@ -723,7 +817,6 @@ elif app_mode == "Statistical Framework Core":
             name=f'{stat_asset} Price',
             line=dict(color='#8A2BE2', width=2.5)
         ))
-
         fig.add_trace(go.Scatter(
             x=df_filtered.index,
             y=df_filtered['HRF_Drawdown'] * 100,
@@ -732,7 +825,6 @@ elif app_mode == "Statistical Framework Core":
             line=dict(color='#FF0055', width=1.5),
             yaxis='y2'
         ))
-
         fig.update_layout(
             title=f"<b>{stat_asset} Framework - Model By HRF</b>",
             xaxis=dict(title="Timeline Series", gridcolor='#222222'),
@@ -743,13 +835,13 @@ elif app_mode == "Statistical Framework Core":
             plot_bgcolor='#0d0d11',
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-
         st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("📊 Path Analysis Metrics")
         m1, m2 = st.columns(2)
         m1.metric("Current Asset Close", f"${df_filtered['close'].iloc[-1]:,.2f}")
         m2.metric("Max Trapped Path Drawdown", f"{df_filtered['HRF_Drawdown'].min() * 100:.2f}%")
+        gc.collect()
 
     except Exception as ex:
         st.error(f"Ecosystem failed inside statistical block calculations: {ex}")
