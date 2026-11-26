@@ -361,9 +361,37 @@ if app_mode == "Algorithmic Fractal Scan":
     st.header("🎯 TradingView Core Fractal Scanner")
 
     t_asset = st.sidebar.selectbox("Baseline Target Asset", list(ticker_map.keys()), index=0)
-    s_pool = st.sidebar.selectbox("Scan Matching Pool Range", ["All Assets"] + list(ticker_map.keys()), index=0)
+    s_pool = st.sidebar.selectbox("Scan Matching Pool Range", list(ticker_map.keys()), index=0)
     i_choice = st.sidebar.selectbox("Sequence Time Frame Interval", ['1month', '1 week', '1day', '4h', '1h', '15m', '5m', '1m'], index=2)
     f_mode = st.sidebar.selectbox("Framework Processing Mode", ["Calculate Fractals", "Manual Compare"], index=0)
+
+    st.sidebar.markdown("### 🎛️ Noise & Pattern Regime Filters")
+    corr_min, corr_max = st.sidebar.slider(
+        "Correlation Filter Range (Min to Max)",
+        min_value=-1.0,
+        max_value=1.0,
+        value=(0.40, 1.00),
+        step=0.05
+    )
+    mse_min, mse_max = st.sidebar.slider(
+        "MSE Error Filter Range (Min to Max)",
+        min_value=0.0,
+        max_value=200.0,
+        value=(0.0, 25.0),
+        step=0.5
+    )
+    pattern_regime = st.sidebar.selectbox(
+        "Candidate Pattern Regime",
+        ["All", "Bullish", "Bearish", "Sideways"],
+        index=0
+    )
+    sideways_thresh = st.sidebar.number_input(
+        "Sideways Band (+/- % Net Move)",
+        min_value=0.1,
+        max_value=25.0,
+        value=2.0,
+        step=0.1
+    )
 
     st.sidebar.markdown("### 📊 Inter-Asset Correlation Layer")
     enable_corr = st.sidebar.checkbox("Overlay Rolling Macro Asset Correlation", value=False)
@@ -385,6 +413,12 @@ if app_mode == "Algorithmic Fractal Scan":
     g_bars = st.sidebar.text_input("Temporal Separation Buffer Width (Bars)", value="20")
     v_boost = st.sidebar.text_input("Amplitude Volatility Boost Multiplier (%)", value="0")
     s_bands = st.sidebar.text_input("Standard Deviation Pipeline Bands (+/-)", value="1.0")
+
+    def classify_pattern_regime(scaled_window, sw_band):
+        net_shift = float(scaled_window[-1] - scaled_window[0])
+        if abs(net_shift) <= sw_band:
+            return "Sideways"
+        return "Bullish" if net_shift > sw_band else "Bearish"
 
     try:
         target_bars_num = int(t_bars)
@@ -415,7 +449,7 @@ if app_mode == "Algorithmic Fractal Scan":
                 target_df = close_target.loc[pd.to_datetime(start_clean):pd.to_datetime(end_clean)]
                 if len(target_df) == 0:
                     target_df = close_target.iloc[-target_bars_num:]
-            except:
+            except Exception:
                 target_df = close_target.iloc[-target_bars_num:]
 
         target_bars_num = len(target_df)
@@ -423,16 +457,24 @@ if app_mode == "Algorithmic Fractal Scan":
             st.error("Selected timeline coordinates do not contain market bar metrics.")
             st.stop()
 
-        target_scaled = percentage_return_scale(target_df.tolist())
+        target_scaled = percentage_return_scale(target_df.to_numpy(dtype=np.float32))
+        target_norm = target_scaled - np.mean(target_scaled)
+        target_std = float(np.std(target_norm))
+        target_regime = classify_pattern_regime(target_scaled, float(sideways_thresh))
+
+        st.caption(
+            f"Target Regime: **{target_regime}** | Corr Window: **[{corr_min:.2f}, {corr_max:.2f}]** | "
+            f"MSE Window: **[{mse_min:.1f}, {mse_max:.1f}]** | Regime Filter: **{pattern_regime}**"
+        )
 
         plt.style.use('dark_background')
         if enable_corr:
-            fig_frac, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 11), sharex=True, gridspec_kw={'height_ratios': [2.5, 1]})
+            fig_frac, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9), sharex=True, gridspec_kw={'height_ratios': [2.5, 1]})
         else:
-            fig_frac, ax1 = plt.subplots(1, 1, figsize=(16, 8))
+            fig_frac, ax1 = plt.subplots(1, 1, figsize=(14, 6.5))
             ax2 = None
 
-        ax1.plot(target_scaled, color='#00ffcc', linewidth=4, label=f'TARGET: {t_asset} ({i_choice})', zorder=5)
+        ax1.plot(target_scaled, color='#00ffcc', linewidth=3.5, label=f'TARGET: {t_asset} ({i_choice}) [{target_regime}]', zorder=5)
 
         if f_mode == "Manual Compare":
             starts = [s.strip() for s in ov_starts.split(',') if s.strip()]
@@ -443,116 +485,121 @@ if app_mode == "Algorithmic Fractal Scan":
             for idx, (st_val, ed_val) in enumerate(zip(starts, ends)):
                 try:
                     ov_df = close_target.loc[pd.to_datetime(st_val):pd.to_datetime(ed_val)]
-                    if len(ov_df) == 0: continue
-                    ov_scaled = percentage_return_scale(ov_df.tolist())
+                    if len(ov_df) == 0:
+                        continue
+                    ov_scaled = percentage_return_scale(ov_df.to_numpy(dtype=np.float32))
+                    reg_tag = classify_pattern_regime(ov_scaled, float(sideways_thresh))
+                    if pattern_regime != "All" and reg_tag != pattern_regime:
+                        continue
                     manual_paths_list.append(ov_scaled)
 
                     if isolate_clean == 'all' or (isolate_clean.isdigit() and int(isolate_clean) == idx + 1):
-                        ax1.plot(ov_scaled, linewidth=2, linestyle='--', alpha=0.6, label=f'Manual #{idx+1} [{st_val}]')
-                except:
+                        ax1.plot(ov_scaled, linewidth=2, linestyle='--', alpha=0.65, label=f'Manual #{idx+1} [{reg_tag}]')
+                except Exception:
                     pass
 
             if manual_paths_list and isolate_clean in ['all', 'mean']:
                 max_len = max(len(p) for p in manual_paths_list)
                 padded_list = [np.pad(p, (0, max_len - len(p)), 'edge') if len(p) < max_len else p for p in manual_paths_list]
-                manual_matrix = np.vstack(padded_list)
-                manual_matrix_boosted = manual_matrix * (1.0 + (vol_boost_pct / 100.0))
-                m_mean = np.mean(manual_matrix_boosted, axis=0)
-                m_std = np.std(manual_matrix_boosted, axis=0)
+                manual_matrix = np.vstack(padded_list) * (1.0 + (vol_boost_pct / 100.0))
+                m_mean = np.mean(manual_matrix, axis=0)
+                m_std = np.std(manual_matrix, axis=0)
 
                 if std_dev_multiplier > 0:
                     ax1.fill_between(range(len(m_mean)), m_mean - (m_std * std_dev_multiplier), m_mean + (m_std * std_dev_multiplier), color='#ff00ff', alpha=0.12)
-                ax1.plot(m_mean, color='#ff00ff', linewidth=4, label='MANUAL COMPOSITE MEAN TRACK', zorder=6)
+                ax1.plot(m_mean, color='#ff00ff', linewidth=3.5, label='MANUAL COMPOSITE MEAN TRACK', zorder=6)
 
         else:
-            assets_to_scan = list(ticker_map.keys()) if s_pool == "All Assets" else [s_pool]
-            all_discovered_results = []
+            if start_clean == 'latest' or end_clean == 'latest':
+                history_pool = close_target.iloc[:-target_bars_num].to_numpy(dtype=np.float32)
+                history_dates = close_target.index[:-target_bars_num]
+            else:
+                history_pool = close_target.to_numpy(dtype=np.float32)
+                history_dates = close_target.index
 
-            for idx_a, asset_item in enumerate(assets_to_scan):
-                if idx_a > 0 and i_choice in {'1m', '5m', '15m', '1h', '4h'}:
-                    time.sleep(0.4)
-                df_scan = fetch_legacy_market_data(asset_item, i_choice)
-                if df_scan is None or df_scan.empty: continue
-                close_scan = df_scan['close'].dropna()
+            win_len = target_bars_num + forecast_bars_num
+            max_search_index = len(history_pool) - win_len
+            step_size = 5 if i_choice in {'1m', '5m', '15m'} else (2 if i_choice in {'1h', '4h'} else 1)
+            parsed_years = [int(y.strip()) for y in spec_years.split(',') if y.strip() and y.lower() != 'all']
 
-                if asset_item == t_asset and (start_clean == 'latest' or end_clean == 'latest'):
-                    history_pool = close_scan.iloc[:-target_bars_num].tolist()
-                    history_dates = close_scan.index[:-target_bars_num]
-                else:
-                    history_pool = close_scan.tolist()
-                    history_dates = close_scan.index
-
-                max_search_index = len(history_pool) - (target_bars_num + forecast_bars_num)
-                if max_search_index <= 0: continue
-
-                parsed_years = [int(y.strip()) for y in spec_years.split(',') if y.strip() and y.lower() != 'all']
-
-                for i in range(max_search_index):
+            candidates = []
+            if max_search_index > 0 and target_std > 1e-12:
+                for i in range(0, max_search_index, step_size):
                     hist_year = history_dates[i].year
-                    if hist_year == 2026: continue
+                    if hist_year == 2026:
+                        continue
                     hist_regime = get_election_regime(hist_year)
-
-                    if c_filter != 'All Cycles' and hist_regime != c_filter: continue
-                    if parsed_years and hist_year not in parsed_years: continue
+                    if c_filter != 'All Cycles' and hist_regime != c_filter:
+                        continue
+                    if parsed_years and hist_year not in parsed_years:
+                        continue
 
                     hist_pattern = history_pool[i : i + target_bars_num]
-                    hist_scaled = percentage_return_scale(hist_pattern)
+                    base_p = hist_pattern[0]
+                    if base_p == 0:
+                        continue
+                    hist_scaled = ((hist_pattern - base_p) / base_p) * 100.0
+
+                    p_reg = classify_pattern_regime(hist_scaled, float(sideways_thresh))
+                    if pattern_regime != "All" and p_reg != pattern_regime:
+                        continue
 
                     mse = float(np.mean((target_scaled - hist_scaled) ** 2))
-                    corr = float(np.corrcoef(target_scaled, hist_scaled)[0, 1])
+                    if not (mse_min <= mse <= mse_max):
+                        continue
 
-                    all_discovered_results.append({
-                        'asset_name': asset_item, 'start_index': i, 'end_index': i + target_bars_num,
-                        'mse': mse, 'correlation': corr, 'year': hist_year,
-                        'raw_prices': history_pool[i : i + target_bars_num + forecast_bars_num],
-                        'date_str': history_dates[i].strftime('%Y-%m-%d %H:%M')
-                    })
+                    h_norm = hist_scaled - np.mean(hist_scaled)
+                    denom = target_std * float(np.std(h_norm))
+                    corr = float(np.dot(target_norm, h_norm) / (target_bars_num * denom)) if denom > 1e-12 else 0.0
+                    if not (corr_min <= corr <= corr_max):
+                        continue
 
-            if all_discovered_results:
-                match_df = pd.DataFrame(all_discovered_results).sort_values(by='mse', ascending=True)
-                unique_matches, seen_clusters = [], set()
-                for _, row in match_df.iterrows():
-                    s, e, a = row['start_index'], row['end_index'], row['asset_name']
-                    if not any(max(s, es - gap_bars_num) < min(e, ee + gap_bars_num) for es, ee, aa in seen_clusters if aa == a):
-                        unique_matches.append(row)
-                        seen_clusters.add((s, e, a))
-                    if len(unique_matches) >= num_fractals_num: break
+                    candidates.append((mse, corr, i, i + target_bars_num, history_dates[i].strftime('%Y-%m-%d %H:%M'), p_reg))
 
-                all_scaled_paths_list = []
-                for row in unique_matches:
-                    raw_full = row['raw_prices']
-                    scaled_full = ((np.array(raw_full) - raw_full[0]) / raw_full[0]) * 100.0 if raw_full[0] != 0 else np.zeros_like(raw_full)
-                    all_scaled_paths_list.append(scaled_full)
+            if candidates:
+                candidates.sort(key=lambda x: x[0])
+                unique_matches = []
+                for mse_val, corr_val, s_idx, e_idx, d_str, p_reg in candidates:
+                    if not any(max(s_idx, es - gap_bars_num) < min(e_idx, ee + gap_bars_num) for _, _, es, ee, _, _ in unique_matches):
+                        unique_matches.append((mse_val, corr_val, s_idx, e_idx, d_str, p_reg))
+                    if len(unique_matches) >= num_fractals_num:
+                        break
 
-                if all_scaled_paths_list:
-                    stacked_paths = np.vstack(all_scaled_paths_list)
-                    stacked_paths_boosted = stacked_paths * (1.0 + (vol_boost_pct / 100.0))
-                    mean_path_array = np.mean(stacked_paths_boosted, axis=0)
-                else:
-                    mean_path_array = None
+                all_scaled_paths = []
+                for _, _, s_idx, _, _, _ in unique_matches:
+                    raw_full = history_pool[s_idx : s_idx + win_len]
+                    scaled_full = ((raw_full - raw_full[0]) / raw_full[0]) * 100.0 if raw_full[0] != 0 else np.zeros_like(raw_full)
+                    all_scaled_paths.append(scaled_full * (1.0 + (vol_boost_pct / 100.0)))
 
+                stacked_paths = np.vstack(all_scaled_paths)
+                mean_path_array = np.mean(stacked_paths, axis=0)
                 isolate_clean = iso_path.strip().lower()
 
                 if isolate_clean != 'mean':
-                    for idx, row in enumerate(unique_matches):
-                        if isolate_clean.isdigit() and int(isolate_clean) != idx + 1: continue
-                        raw_full = row['raw_prices']
-                        scaled_full = ((np.array(raw_full) - raw_full[0]) / raw_full[0]) * 100.0
-                        scaled_full_boosted = scaled_full * (1.0 + (vol_boost_pct / 100.0))
-                        ax1.plot(scaled_full_boosted, linestyle='--', alpha=0.5, label=f"#{idx+1} {row['asset_name']} ({row['date_str']})")
+                    for idx, (mse_val, corr_val, _, _, d_str, p_reg) in enumerate(unique_matches):
+                        if isolate_clean.isdigit() and int(isolate_clean) != idx + 1:
+                            continue
+                        ax1.plot(
+                            all_scaled_paths[idx],
+                            linestyle='--',
+                            alpha=0.6,
+                            label=f"#{idx+1} [{p_reg}] r={corr_val:.2f} mse={mse_val:.1f} ({d_str})"
+                        )
 
-                if mean_path_array is not None and isolate_clean in ['all', 'mean']:
+                if isolate_clean in ['all', 'mean']:
                     if std_dev_multiplier > 0:
-                        std_path = np.std(stacked_paths * (1.0 + (vol_boost_pct / 100.0)), axis=0)
+                        std_path = np.std(stacked_paths, axis=0)
                         ax1.fill_between(range(len(mean_path_array)), mean_path_array - (std_path * std_dev_multiplier), mean_path_array + (std_path * std_dev_multiplier), color='#ff00ff', alpha=0.1)
-                    ax1.plot(mean_path_array, color='#ff00ff', linewidth=4, label='COMPOSITE FRACTAL MEAN (Excluding 2026)', zorder=6)
+                    ax1.plot(mean_path_array, color='#ff00ff', linewidth=3.5, label=f'COMPOSITE MEAN ({pattern_regime})', zorder=6)
                 ax1.axvline(x=target_bars_num - 1, color='#ffffff', linestyle=':', alpha=0.5)
 
-                if enable_corr and ax2 is not None and mean_path_array is not None:
+                if enable_corr and ax2 is not None:
                     r_wave = calculate_rolling_correlation(target_scaled, mean_path_array, c_win)
                     ax2.plot(r_wave, color='#ff00ff', linewidth=2.5, label=f"Rolling {c_win}-Bar Correlation")
                     ax2.fill_between(range(len(r_wave)), r_wave, 0, where=(np.array(r_wave) >= 0), color='#00ff88', alpha=0.15)
                     ax2.fill_between(range(len(r_wave)), r_wave, 0, where=(np.array(r_wave) < 0), color='#ff0055', alpha=0.15)
+            else:
+                st.warning("No fractals matched your current Correlation, MSE, and Regime filters. Widen the sliders or select 'All'.")
 
         ax1.axhline(y=0.0, color='#555555', linestyle='-', linewidth=1.2)
         ax1.set_title("HRF MATRIX ENGINE — Model By HRF", color='#ffffff', fontsize=12, fontweight='bold')
@@ -568,6 +615,8 @@ if app_mode == "Algorithmic Fractal Scan":
 
         plt.tight_layout()
         st.pyplot(fig_frac)
+        plt.close(fig_frac)
+        gc.collect()
     except Exception as e:
         st.error(f"Ecosystem halted: {e}")
 
