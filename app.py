@@ -77,201 +77,133 @@ def get_election_regime(year):
 # ==============================================================================
 # DATA PIPELINE (COINGECKO LIVE + LARGE 1M CSV STREAMING RESAMPLER)
 # ==============================================================================
-def _extract_gdrive_id(url):
-    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
-    if m:
-        return m.group(1)
-    m2 = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
-    if m2:
-        return m2.group(1)
-    return None
-
-def _open_remote_csv_stream(raw_url):
-    u = raw_url.strip()
-    file_id = _extract_gdrive_id(u)
-    session = requests.Session()
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    if file_id:
-        url = f"https://drive.usercontent.google.com/download?export=download&id={file_id}&confirm=t"
-        resp = session.get(url, headers=headers, stream=True, timeout=60)
-        resp.raise_for_status()
-        ct = resp.headers.get("Content-Type", "")
-        if "text/html" in ct:
-            html_text = resp.text
-            action_match = re.search(r'action="([^"]+)"', html_text)
-            inputs = dict(re.findall(r'name="([^"]+)"\s+value="([^"]*)"', html_text))
-            if action_match and inputs:
-                action_url = action_match.group(1).replace("&amp;", "&")
-                resp = session.get(action_url, params=inputs, headers=headers, stream=True, timeout=60)
-                resp.raise_for_status()
-                ct = resp.headers.get("Content-Type", "")
-        if "text/html" in ct:
-            raise ValueError("Google Drive returned an HTML page instead of CSV file data. Check sharing permissions.")
-        return resp
-
-    resp = session.get(u, headers=headers, stream=True, timeout=60)
-    resp.raise_for_status()
-    return resp
-
-def _clean_chunk(df, time_col):
-    ts = df[time_col]
-    if pd.api.types.is_numeric_dtype(ts):
-        max_v = ts.max()
-        unit = 'us' if max_v > 1e14 else ('ms' if max_v > 1e11 else 's')
-        idx = pd.to_datetime(ts, unit=unit, errors='coerce')
-    else:
-        idx = pd.to_datetime(ts, errors='coerce')
-
+def _normalize_ohlcv_df(df):
     out = df.copy()
-    out.index = idx
-    out.index.name = 'time'
-    out.columns = [str(c).strip().lower() for c in out.columns]
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        if col not in out.columns:
-            out[col] = out['close'] if (col != 'volume' and 'close' in out.columns) else 0.0
-        out[col] = pd.to_numeric(out[col], errors='coerce')
-    return out[['open', 'high', 'low', 'close', 'volume']].dropna(subset=['close'])
 
-@st.cache_data(ttl=3600, show_spinner="Streaming & resampling 1m CSV...")
-def _load_and_resample_large_csv(raw_url, interval_str):
-    rule_map = {'1m': '1min', '5m': '5min', '15m': '15min', '1h': '1h', '4h': '4h'}
+    # If timestamps are already a DatetimeIndex, keep them; otherwise locate a time column
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.columns = [str(c).strip().lower() for c in out.columns]
+        time_col = next(
+            (c for c in ["time", "timestamp", "date", "open_time", "datetime"] if c in out.columns),
+            None,
+        )
+        if time_col is not None:
+            ts = out[time_col]
+            if pd.api.types.is_numeric_dtype(ts):
+                s_vals = pd.to_numeric(ts, errors="coerce")
+                max_v = float(s_vals.max()) if not s_vals.dropna().empty else 0.0
+                unit = "us" if max_v > 1e14 else ("ms" if max_v > 1e11 else "s")
+                idx = pd.to_datetime(s_vals, unit=unit, errors="coerce")
+            else:
+                idx = pd.to_datetime(ts, errors="coerce")
+            out.index = idx
+        else:
+            out.index = pd.to_datetime(out.index, errors="coerce")
+    else:
+        out.columns = [str(c).strip().lower() for c in out.columns]
+        out.index = pd.to_datetime(out.index, errors="coerce")
+
+    out.index.name = "time"
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col not in out.columns:
+            out[col] = out["close"] if (col != "volume" and "close" in out.columns) else 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype(np.float32)
+
+    out = out[["open", "high", "low", "close", "volume"]].dropna(subset=["close"])
+    out = out[~out.index.isna()].sort_index()
+    return out[~out.index.duplicated(keep="last")]
+
+
+@st.cache_data(ttl=1800, max_entries=2, show_spinner="Loading & resampling remote data...")
+def _load_and_resample_remote_file(raw_url, interval_str, bar_cap):
+    rule_map = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h"}
     rule = rule_map.get(interval_str)
     if not rule:
         return None
 
+    cap = int(bar_cap)
+    keep_tail = max(cap * 2, 5000)
     resp = _open_remote_csv_stream(raw_url)
-    resp.raw.decode_content = True
 
-    # Stream directly from response body in chunks without building a 400 MB byte string first
-    reader = pd.read_csv(resp.raw, chunksize=50000)
-    resampled_parts = []
-    time_col = None
+    content_bytes = resp.content
+    if not content_bytes:
+        raise ValueError("Downloaded file is empty.")
 
+    # Detect Parquet either by URL extension or Parquet magic bytes ("PAR1")
+    is_parquet = (
+        ".parquet" in raw_url.lower()
+        or content_bytes[:4] == b"PAR1"
+        or content_bytes[-4:] == b"PAR1"
+    )
+
+    if is_parquet:
+        buf = io.BytesIO(content_bytes)
+        del content_bytes
+        gc.collect()
+
+        raw_df = pd.read_parquet(buf, engine="pyarrow")
+        del buf
+        gc.collect()
+
+        cleaned = _normalize_ohlcv_df(raw_df)
+        del raw_df
+        gc.collect()
+
+        if cleaned.empty:
+            return None
+
+        resampled = (
+            cleaned.resample(rule)
+            .agg({
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            })
+            .dropna(subset=["close"])
+            .iloc[-cap:]
+        )
+        del cleaned
+        gc.collect()
+        return resampled[["open", "high", "low", "close", "volume"]]
+
+    # Fallback: chunked CSV streaming
+    buf = io.BytesIO(content_bytes)
+    del content_bytes
+    gc.collect()
+
+    reader = pd.read_csv(buf, chunksize=25000)
+    rolling_df = None
     for part in reader:
-        if time_col is None:
-            time_col = next(
-                (c for c in ['time', 'timestamp', 'date', 'open_time', 'datetime'] if c in part.columns),
-                part.columns[0]
-            )
-        cleaned = _clean_chunk(part, time_col).sort_index()
+        cleaned = _normalize_ohlcv_df(part)
         if not cleaned.empty:
-            r_part = cleaned.resample(rule).agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'volume': 'sum'
-            }).dropna(subset=['close'])
-            resampled_parts.append(r_part)
+            r_part = (
+                cleaned.resample(rule)
+                .agg({
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                })
+                .dropna(subset=["close"])
+            )
+            rolling_df = r_part if rolling_df is None else pd.concat([rolling_df, r_part])
+            rolling_df = rolling_df.sort_index()
+            rolling_df = rolling_df[~rolling_df.index.duplicated(keep="last")].iloc[-keep_tail:]
+            del cleaned, r_part
 
-    if not resampled_parts:
+    del reader, buf
+    gc.collect()
+
+    if rolling_df is None or rolling_df.empty:
         return None
 
-    merged = pd.concat(resampled_parts).sort_index()
-    final_df = merged.groupby(level=0).agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }).sort_index()
-    return final_df[['open', 'high', 'low', 'close', 'volume']]
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _fetch_coingecko_history(cg_id, interval_str):
-    days_map = {
-        '1m': '1', '5m': '7', '15m': '30',
-        '1h': '90', '4h': '180', '1day': '365',
-        '1 week': 'max', '1month': 'max'
-    }
-    days = days_map.get(interval_str, '365')
-    url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart?vs_currency=usd&days={days}"
-
-    for attempt in range(3):
-        resp = requests.get(url, timeout=12)
-        if resp.status_code == 429:
-            time.sleep(1.5 * (attempt + 1))
-            continue
-        resp.raise_for_status()
-        break
-    else:
-        return None
-
-    data = resp.json()
-    prices = data.get('prices', [])
-    if not prices:
-        return None
-
-    df = pd.DataFrame(prices, columns=['ts', 'close'])
-    df['time'] = pd.to_datetime(df['ts'], unit='ms')
-    df['close'] = pd.to_numeric(df['close'], errors='coerce')
-    df = df.dropna(subset=['time', 'close']).set_index('time').sort_index()
-
-    vols = data.get('total_volumes', [])
-    if vols:
-        v_df = pd.DataFrame(vols, columns=['ts', 'volume'])
-        v_df['time'] = pd.to_datetime(v_df['ts'], unit='ms')
-        v_df = v_df.set_index('time').sort_index()
-        df['volume'] = pd.to_numeric(v_df['volume'], errors='coerce').reindex(df.index, method='nearest').fillna(0.0)
-    else:
-        df['volume'] = 0.0
-
-    df['open'] = df['close'].shift(1).fillna(df['close'])
-    df['high'] = df[['open', 'close']].max(axis=1)
-    df['low'] = df[['open', 'close']].min(axis=1)
-
-    resample_rules = {
-        '1m': '1min', '5m': '5min', '15m': '15min',
-        '1h': '1h', '4h': '4h', '1day': '1D',
-        '1 week': '1W', '1month': '1ME'
-    }
-    rule = resample_rules.get(interval_str)
-    if rule:
-        df = df.resample(rule).agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        }).dropna(subset=['close'])
-
-    return df[['open', 'high', 'low', 'close', 'volume']]
-
-def fetch_legacy_market_data(asset_name, interval_str):
-    cg_id = ticker_map.get(asset_name)
-    df_live = None
-    source_note = []
-
-    if cg_id is not None:
-        try:
-            df_live = _fetch_coingecko_history(cg_id, interval_str)
-            if df_live is not None and not df_live.empty:
-                source_note.append(f"Live ({len(df_live)} bars)")
-        except Exception:
-            df_live = None
-
-    intraday_frames = {'1m', '5m', '15m', '1h', '4h'}
-    if csv_url_input.strip() and asset_name == csv_asset_choice and interval_str in intraday_frames:
-        try:
-            df_csv = _load_and_resample_large_csv(csv_url_input.strip(), interval_str)
-            if df_csv is not None and not df_csv.empty:
-                source_note.append(f"CSV ({len(df_csv)} bars)")
-                if df_live is None or df_live.empty:
-                    data_status_box.caption("📡 Source: " + " | ".join(source_note))
-                    return df_csv
-                hist_gap = df_csv[df_csv.index < df_live.index.min()]
-                if not hist_gap.empty:
-                    combined = pd.concat([hist_gap, df_live])
-                    merged = combined[~combined.index.duplicated(keep='last')].sort_index()
-                    data_status_box.caption(f"📡 Source: CSV + Live ({len(merged)} bars)")
-                    return merged
-        except Exception as e:
-            data_status_box.caption(f"⚠️ CSV skipped: {e}")
-
-    if source_note:
-        data_status_box.caption("📡 Source: " + " | ".join(source_note))
-    return df_live
+    final_df = rolling_df.iloc[-cap:].copy()
+    del rolling_df
+    gc.collect()
+    return final_df[["open", "high", "low", "close", "volume"]]
 
 # ==============================================================================
 # NATIVE VECTORIZED MATH AND INDICATORS CALCULATOR
